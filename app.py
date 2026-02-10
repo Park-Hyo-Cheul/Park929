@@ -7,8 +7,14 @@ import inspect
 from typing import Any
 
 import streamlit as st
+from dotenv import load_dotenv
 
+from cdss.medqna.composer import compose_answer
+from cdss.medqna.query_router import route_query
+from cdss.medqna.retriever import retrieve_evidence
 from reasoning_engine import Rule, run_engine
+
+load_dotenv()
 
 
 def _import_build_facts():
@@ -53,7 +59,6 @@ def _load_rules_from_registry(
     if guideline_version:
         kwargs["guideline_version"] = guideline_version
 
-    # Try keyword-based calling first, then safe positional fallback.
     try:
         packs = load_packs(selected_packs, **kwargs)
     except TypeError:
@@ -67,7 +72,6 @@ def _load_rules_from_registry(
     if packs is None:
         return []
 
-    # Accept either a direct list[Rule] or a dict of pack metadata containing rules.
     if isinstance(packs, list) and all(isinstance(rule, Rule) for rule in packs):
         return packs
 
@@ -80,8 +84,6 @@ def _load_rules_from_registry(
 
 
 def _fallback_rules() -> list[Rule]:
-    """Provide minimal fallback rule pack when no registry packs are available."""
-
     return [
         Rule(
             id="htn_stage2",
@@ -112,15 +114,12 @@ def _normalize_labs(facts: dict[str, Any], normalize: bool) -> dict[str, Any]:
         return facts
 
     normalized = dict(facts)
-
-    # Creatinine normalization to mg/dL.
     creatinine = facts.get("creatinine")
     if creatinine is not None and facts.get("creatinine_unit") == "µmol/L":
         normalized["creatinine_mg_dl"] = round(creatinine / 88.4, 3)
     elif creatinine is not None:
         normalized["creatinine_mg_dl"] = creatinine
 
-    # Glucose normalization to mg/dL.
     glucose = facts.get("glucose")
     if glucose is not None and facts.get("glucose_unit") == "mmol/L":
         normalized["glucose_mg_dl"] = round(glucose * 18.0, 2)
@@ -157,55 +156,51 @@ def _warning_messages(facts: dict[str, Any]) -> list[str]:
     return warnings
 
 
-st.set_page_config(page_title="CDSS Reasoning UI", layout="wide")
-st.title("CDSS Reasoning Engine")
-st.caption("For clinician use only (not patient advice).")
-st.info(
-    "Outputs are clinical suggestions with rationale and metadata. They are not direct patient instructions and do not replace clinician judgment."
-)
+def _render_reasoning_engine_tab() -> None:
+    with st.form("cdss_form"):
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            age = st.number_input("Age", min_value=0, max_value=130, step=1, value=45)
+            sex = st.selectbox("Sex", options=["female", "male", "intersex", "other", "unknown"], index=0)
+            diabetes = st.checkbox("Diabetes", value=False)
+            pregnancy = st.checkbox("Pregnancy", value=False)
 
-with st.form("cdss_form"):
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        age = st.number_input("Age", min_value=0, max_value=130, step=1, value=45)
-        sex = st.selectbox("Sex", options=["female", "male", "intersex", "other", "unknown"], index=0)
-        diabetes = st.checkbox("Diabetes", value=False)
-        pregnancy = st.checkbox("Pregnancy", value=False)
+        with c2:
+            systolic_bp = st.number_input("Systolic BP (mmHg)", min_value=50, max_value=300, value=130)
+            diastolic_bp = st.number_input("Diastolic BP (mmHg)", min_value=30, max_value=200, value=80)
+            ckd_stage = st.selectbox("CKD stage", options=["None", "1", "2", "3", "4", "5"], index=0)
 
-    with c2:
-        systolic_bp = st.number_input("Systolic BP (mmHg)", min_value=50, max_value=300, value=130)
-        diastolic_bp = st.number_input("Diastolic BP (mmHg)", min_value=30, max_value=200, value=80)
-        ckd_stage = st.selectbox("CKD stage", options=["None", "1", "2", "3", "4", "5"], index=0)
+        with c3:
+            creatinine = st.number_input("Creatinine (optional)", min_value=0.0, step=0.1, value=0.0)
+            creatinine_unit = st.selectbox("Creatinine unit", options=["mg/dL", "µmol/L"], index=0)
+            glucose = st.number_input("Glucose (optional)", min_value=0.0, step=0.1, value=0.0)
+            glucose_unit = st.selectbox("Glucose unit", options=["mg/dL", "mmol/L"], index=0)
 
-    with c3:
-        creatinine = st.number_input("Creatinine (optional)", min_value=0.0, step=0.1, value=0.0)
-        creatinine_unit = st.selectbox("Creatinine unit", options=["mg/dL", "µmol/L"], index=0)
-        glucose = st.number_input("Glucose (optional)", min_value=0.0, step=0.1, value=0.0)
-        glucose_unit = st.selectbox("Glucose unit", options=["mg/dL", "mmol/L"], index=0)
+        st.subheader("Pack selection")
+        packs = st.multiselect(
+            "Select pack(s)",
+            options=["hypertension", "diabetes", "ckd", "pregnancy"],
+            default=["hypertension"],
+        )
 
-    st.subheader("Pack selection")
-    default_pack = ["hypertension"]
-    packs = st.multiselect(
-        "Select pack(s)",
-        options=["hypertension", "diabetes", "ckd", "pregnancy"],
-        default=default_pack,
-    )
+        g1, g2, g3 = st.columns(3)
+        with g1:
+            guideline_name = st.selectbox(
+                "Guideline name (optional)", options=["", "ACC/AHA", "ESC/ESH", "NICE", "KDIGO"], index=0
+            )
+        with g2:
+            guideline_name_custom = st.text_input("Or enter guideline name")
+        with g3:
+            guideline_version = st.text_input("Guideline version (optional)", placeholder="e.g., 2024")
 
-    g1, g2, g3 = st.columns(3)
-    with g1:
-        guideline_name = st.selectbox("Guideline name (optional)", options=["", "ACC/AHA", "ESC/ESH", "NICE", "KDIGO"], index=0)
-    with g2:
-        guideline_name_custom = st.text_input("Or enter guideline name")
-    with g3:
-        guideline_version = st.text_input("Guideline version (optional)", placeholder="e.g., 2024")
+        normalize = st.toggle("Normalize lab units", value=True)
+        run_clicked = st.form_submit_button("Run")
 
-    normalize = st.toggle("Normalize lab units", value=True)
-    run_clicked = st.form_submit_button("Run")
+    if not run_clicked:
+        return
 
-if run_clicked:
     selected_guideline = guideline_name_custom.strip() or guideline_name.strip() or None
     version = guideline_version.strip() or None
-
     raw_facts: dict[str, Any] = {
         "age": int(age),
         "sex": sex,
@@ -223,48 +218,105 @@ if run_clicked:
         raw_facts["glucose"] = float(glucose)
         raw_facts["glucose_unit"] = glucose_unit
 
-    facts = _build_facts(raw_facts)
-    facts = _normalize_labs(facts, normalize)
-
-    selected_packs = packs or ["hypertension"]
-    rules = _load_rules_from_registry(selected_packs, selected_guideline, version)
+    facts = _normalize_labs(_build_facts(raw_facts), normalize)
+    rules = _load_rules_from_registry(packs or ["hypertension"], selected_guideline, version)
     if not rules:
         st.info("Using built-in fallback pack because no registry packs were loaded.")
         rules = _fallback_rules()
 
-    required_fields = ["age", "sex", "systolic_bp", "diastolic_bp"]
-
     try:
-        result = run_engine(facts, rules, required_fields=required_fields)
+        result = run_engine(facts, rules, required_fields=["age", "sex", "systolic_bp", "diastolic_bp"])
     except Exception as exc:
         st.error(f"Engine execution failed: {exc}")
-    else:
-        st.subheader("Clinical suggestions (matched outcomes)")
-        if result.matched_outcomes:
-            st.table(result.matched_outcomes)
-        else:
-            st.write("No suggestions matched current facts.")
+        return
 
-        st.subheader("Explanations")
-        for item in result.explanation:
-            label = f"{item.rule_id} — {'matched' if item.matched else 'not matched'}"
-            with st.expander(label, expanded=False):
-                st.write(item.description)
-                st.json(
-                    {
-                        "matched": item.matched,
-                        "outcome": item.outcome,
-                    }
-                )
+    st.subheader("Clinical suggestions (matched outcomes)")
+    st.table(result.matched_outcomes) if result.matched_outcomes else st.write("No suggestions matched current facts.")
 
-        st.subheader("Warnings")
-        warnings = _warning_messages(facts)
-        if warnings:
-            for warning in warnings:
-                st.info(warning)
-        else:
-            st.info("No additional warning-tier signals detected.")
+    st.subheader("Explanations")
+    for item in result.explanation:
+        with st.expander(f"{item.rule_id} — {'matched' if item.matched else 'not matched'}", expanded=False):
+            st.write(item.description)
+            st.json({"matched": item.matched, "outcome": item.outcome})
 
-        st.caption(
-            "These outputs are for clinician interpretation only. Apply local protocols, confirmatory evaluation, and patient-specific context before acting."
+    st.subheader("Warnings")
+    for warning in _warning_messages(facts) or ["No additional warning-tier signals detected."]:
+        st.info(warning)
+
+
+def _render_medical_qna_tab() -> None:
+    st.caption("Medical reference only. Not patient-specific medical advice.")
+
+    with st.form("medqna_form"):
+        question = st.text_area("Question", placeholder="e.g., Initial management of new-onset HFrEF?")
+        specialty = st.selectbox(
+            "Specialty",
+            options=["general", "cardiology", "endocrinology", "nephrology", "oncology", "rheumatology", "all"],
+            index=0,
         )
+        mcq_mode = st.checkbox("MCQ mode", value=False)
+        choices_raw = st.text_area("Choices (one per line, optional)", placeholder="A) ...\nB) ...")
+        user_links_raw = st.text_area("Guideline links (optional, one per line)")
+        ask_clicked = st.form_submit_button("Answer")
+
+    if not ask_clicked or not question.strip():
+        return
+
+    choices = [line.strip() for line in choices_raw.splitlines() if line.strip()]
+    user_links = [line.strip() for line in user_links_raw.splitlines() if line.strip()]
+    query_type = route_query(question, mcq_mode=mcq_mode, choices=choices)
+
+    with st.spinner("Retrieving PubMed and guideline evidence..."):
+        evidence = retrieve_evidence(question=question, specialty=specialty, user_guideline_links=user_links)
+        answer = compose_answer(question, query_type, evidence, specialty=specialty, mcq_choices=choices)
+
+    st.markdown("### Pathophysiology")
+    st.write(answer.pathophysiology)
+    st.markdown("### Clinical Features")
+    st.write(answer.clinical_features)
+    st.markdown("### Diagnosis")
+    st.write(answer.diagnosis)
+    st.markdown("### Treatment")
+    st.write(answer.treatment)
+    st.markdown("### Latest Evidence")
+    st.write(answer.latest_evidence)
+    st.markdown("### Confidence")
+    st.write(answer.confidence_statement)
+
+    if answer.mcq_explanations:
+        st.markdown("### MCQ Option Review")
+        for option in answer.mcq_explanations:
+            verdict = "✅ Correct" if option.is_correct else "• Not selected"
+            st.write(f"**{option.option}** — {verdict}: {option.explanation}")
+
+    st.markdown("### Citations")
+    for citation in answer.citations:
+        label = f"{citation.source} — {citation.title}"
+        if citation.year:
+            label += f" ({citation.year})"
+        if citation.note:
+            label += f" [{citation.note}]"
+        st.write(f"- {label}")
+        if citation.url:
+            st.write(citation.url)
+
+    if answer.notes:
+        st.warning("; ".join(answer.notes))
+
+
+st.set_page_config(page_title="CDSS Reasoning UI", layout="wide")
+st.title("CDSS Reasoning Engine")
+st.caption("For clinician use only (not patient advice).")
+st.info(
+    "Outputs are clinical suggestions with rationale and metadata. They are not direct patient instructions and do not replace clinician judgment."
+)
+
+reasoning_tab, medqna_tab = st.tabs(["Reasoning Engine", "Medical Q&A"])
+with reasoning_tab:
+    _render_reasoning_engine_tab()
+with medqna_tab:
+    _render_medical_qna_tab()
+
+st.caption(
+    "These outputs are for clinician interpretation only. Apply local protocols, confirmatory evaluation, and patient-specific context before acting."
+)
