@@ -1,0 +1,2 @@
+case_id,rmse,min_canal_distance,guide_generated,execution_time_ms,passed
+case_001,0.2692582403567241,3.0,True,0,True
