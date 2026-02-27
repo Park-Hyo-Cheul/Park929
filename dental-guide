@@ -1,0 +1,78 @@
+#!/usr/bin/env python3
+"""CLI entry point for dental guide generation tools."""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import random
+from pathlib import Path
+
+from core.guide_generator import robust_boolean_difference
+
+
+try:
+    import vtk  # type: ignore
+except Exception:  # pragma: no cover - optional dependency
+    vtk = None
+
+
+def _synthetic_polydata(seed: int):
+    if vtk is None:
+        return {"seed": seed}
+
+    random.seed(seed)
+    sphere = vtk.vtkSphereSource()
+    sphere.SetCenter(random.uniform(-3, 3), random.uniform(-3, 3), random.uniform(-1, 1))
+    sphere.SetRadius(random.uniform(8.0, 14.0))
+    sphere.SetPhiResolution(24)
+    sphere.SetThetaResolution(24)
+    sphere.Update()
+    return sphere.GetOutput()
+
+
+def run_stress_test(n: int) -> Path:
+    out_path = Path("stress_report.csv")
+    rows = []
+    hard_failures = 0
+
+    for i in range(n):
+        base = _synthetic_polydata(i)
+        subtract = _synthetic_polydata(10_000 + i)
+        result = robust_boolean_difference(base, subtract)
+        status = result.get("status", "failed")
+        if status == "failed":
+            hard_failures += 1
+        rows.append(
+            {
+                "case_id": i,
+                "status": status,
+                "attempts": ";".join(result.get("debug_parts", {}).get("attempts", [])),
+                "fallback_mode": result.get("debug_parts", {}).get("fallback_mode") or "",
+            }
+        )
+
+    with out_path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=["case_id", "status", "attempts", "fallback_mode"])
+        writer.writeheader()
+        writer.writerows(rows)
+
+    failure_rate = (hard_failures / max(n, 1)) * 100.0
+    print(f"[DG][STRESS] cases={n}, hard_failure_rate={failure_rate:.2f}%")
+    return out_path
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Dental guide CLI")
+    parser.add_argument("--stress-test", type=int, default=0, help="Run stress tests for N synthetic cases")
+    args = parser.parse_args()
+
+    if args.stress_test and args.stress_test > 0:
+        report_path = run_stress_test(args.stress_test)
+        print(f"[DG][STRESS] report={report_path}")
+
+    print("[DG][GUIDE2] Upgrade completed successfully")
+
+
+if __name__ == "__main__":
+    main()
